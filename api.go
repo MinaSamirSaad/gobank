@@ -27,12 +27,44 @@ func NewAPIserver(listenAddr string, store Storage) *APIServer {
 
 func (a *APIServer) Run() {
 	router := mux.NewRouter()
+	router.HandleFunc("/login", makeHTTPHandleFunc(a.handleLogin))
+	router.HandleFunc("/logout", handleLogout(makeHTTPHandleFunc(a.handleLogout), a.store))
 	router.HandleFunc("/account", makeHTTPHandleFunc(a.handleAccount))
 	router.HandleFunc("/account/{id}", withJWTAuth(makeHTTPHandleFunc(a.handleAccountById), a.store))
 	router.HandleFunc("/transfer", makeHTTPHandleFunc(a.handleTransfer))
 
 	log.Println("Starting server on", a.listenAddr)
 	http.ListenAndServe(a.listenAddr, router)
+}
+
+func (s *APIServer) handleLogin(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != "POST" {
+		return fmt.Errorf("unsupported method %s", r.Method)
+	}
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	account, err := s.store.Login(req.Email, req.Password)
+	if err != nil {
+		return err
+	}
+
+	return WriteJSON(w, http.StatusOK, &account)
+}
+
+func (s *APIServer) handleLogout(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != "POST" {
+		return fmt.Errorf("unsupported method %s", r.Method)
+	}
+
+	tokenString := r.Header.Get("x-jwt-token")
+	err := s.store.Logout(tokenString)
+	if err != nil {
+		return err
+	}
+	return WriteJSON(w, http.StatusOK, map[string]string{"message": "logout success"})
 }
 
 func (s *APIServer) handleAccount(w http.ResponseWriter, r *http.Request) error {
@@ -57,6 +89,7 @@ func (s *APIServer) handleAccountById(w http.ResponseWriter, r *http.Request) er
 	}
 	return fmt.Errorf("unsupported method %s", r.Method)
 }
+
 func (s *APIServer) handleGetAccount(w http.ResponseWriter, _ *http.Request) error {
 	accounts, err := s.store.GetAccounts()
 	if err != nil {
@@ -95,17 +128,15 @@ func (s *APIServer) handleCreateAccount(w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 	defer r.Body.Close()
-	account := NewAccount(createAccountReq.FirstName, createAccountReq.LastName)
+	account, err := NewAccount(createAccountReq.FirstName, createAccountReq.LastName, createAccountReq.Email, createAccountReq.Password)
+	if err != nil {
+		return err
+	}
 	accountRecord, err := s.store.CreateAccount(account)
 	if err != nil {
 		return err
 	}
 
-	tokenString, err := createJWT(account)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("JWT string token: %s\n", tokenString)
 	return WriteJSON(w, http.StatusOK, accountRecord)
 }
 
@@ -191,7 +222,7 @@ func withJWTAuth(handlerFunc http.HandlerFunc, s Storage) http.HandlerFunc {
 		}
 		claims := token.Claims.(jwt.MapClaims)
 
-		if account.Number != int64(claims["accountNumber"].(float64)) {
+		if account.Email != claims["email"] || tokenString != account.Token {
 			permissionDenied(w)
 			return
 		}
@@ -207,21 +238,49 @@ func validateJWT(tokenString string) (*jwt.Token, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 
-		// hmacSampleSecret is a []byte containing your secret, e.g. []byte("my_secret_key")
 		return []byte(secret), nil
 	})
 }
 
-func createJWT(account *Account) (string, error) {
+func createJWT(email string) (string, error) {
 	secret := os.Getenv("JWTSecret")
 	claims := &jwt.MapClaims{
-		"ExpiresAt":     jwt.NewNumericDate(time.Unix(1516239022, 0)),
-		"accountNumber": account.Number,
+		"ExpiresAt": jwt.NewNumericDate(time.Unix(1516239022, 0)),
+		"email":     email,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
 	return token.SignedString([]byte(secret))
 }
-
-//eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJFeHBpcmVzQXQiOjE1MTYyMzkwMjIsImFjY291bnROdW1iZXIiOjY4NDIzOH0.99gpit7uS1UcO8TWBPiQQ3hBoP3uHgsF8PEJE8JIPWY
+func handleLogout(handlerFunc http.HandlerFunc, s Storage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("calling JWT auth middleware")
+		tokenString := r.Header.Get("x-jwt-token")
+		token, err := validateJWT(tokenString)
+		if err != nil {
+			permissionDenied(w)
+			return
+		}
+		if !token.Valid {
+			permissionDenied(w)
+			return
+		}
+		claims := token.Claims.(jwt.MapClaims)
+		email, ok := claims["email"].(string)
+		if !ok {
+			permissionDenied(w)
+			return
+		}
+		account, err := s.GetAccountByEmail(email)
+		if err != nil {
+			permissionDenied(w)
+			return
+		}
+		if tokenString != account.Token {
+			permissionDenied(w)
+			return
+		}
+		handlerFunc(w, r)
+	}
+}
